@@ -2,7 +2,8 @@
 **/__pycache__/
 .DS_Store
 
-.env
+# .env (but allow modal-login/.env)
+/.env
 .next/
 temp-data/
 swarm.pem
