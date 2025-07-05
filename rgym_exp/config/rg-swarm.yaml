@@ -5,7 +5,7 @@ training:
   max_stage: 1
   hf_push_frequency: 1
   num_generations: 2
-  num_transplant_trees: 1
+  num_transplant_trees: 2
   seed: 42
   fp16: false # set this line to true if your hardware supports fp16
 
@@ -18,7 +18,9 @@ blockchain:
 
 communications:
   initial_peers:
+    - '/ip4/38.101.215.15/tcp/30011/p2p/QmQ2gEXoPJg6iMBSUFWGzAabS2VhnzuS782Y637hGjfsRJ'
     - '/ip4/38.101.215.15/tcp/30012/p2p/QmWhiaLrx3HRZfgXc2i7KW5nMUNK7P9tRc71yFJdGEZKkC'
+    - '/ip4/38.101.215.15/tcp/30013/p2p/QmQa1SCfYTxx7RvU7qJJRo79Zm1RAwPpkeLueDVJuBBmFp'
 
 eval:
   judge_base_url: https://swarm-judge-102957787771.us-east1.run.app
@@ -68,7 +70,7 @@ game_manager:
   data_manager:
     _target_: rgym_exp.src.data.ReasoningGymDataManager
     yaml_config_path: "rgym_exp/src/datasets.yaml"
-    num_train_samples: 1
+    num_train_samples: 2
     num_evaluation_samples: 0
     system_prompt_id: 'default'
     seed: ${training.seed}
@@ -77,7 +79,7 @@ game_manager:
     _target_: genrl.communication.hivemind.hivemind_backend.HivemindBackend
     initial_peers: ${communications.initial_peers}
     identity_path: ${oc.env:IDENTITY_PATH,null}
-    startup_timeout: 300
+    startup_timeout: 120
     beam_size: 50
   coordinator:
     _target_: genrl.blockchain.coordinator.ModalSwarmCoordinator
@@ -93,3 +95,4 @@ default_large_model_pool:
 
 default_small_model_pool:
   - Gensyn/Qwen2.5-0.5B-Instruct
+  - Qwen/Qwen3-0.6B
