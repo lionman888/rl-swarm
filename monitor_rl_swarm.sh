@@ -47,19 +47,108 @@ check_screen_session() {
     screen -list | grep -q "$SCREEN_SESSION" 2>/dev/null
 }
 
+# 检查screen会话内部是否有活动进程
+check_screen_session_active() {
+    if check_screen_session; then
+        # 检查screen会话中是否有活动的shell或进程
+        local session_info=$(screen -S "$SCREEN_SESSION" -Q windows 2>/dev/null || echo "")
+        if [[ -n "$session_info" ]]; then
+            return 0  # 有活动进程
+        fi
+    fi
+    return 1  # 无活动进程或会话不存在
+}
+
+# 检测特定错误类型
+detect_error_type() {
+    local error_type=""
+    
+    # 检查screen会话输出
+    if check_screen_session; then
+        screen -S "$SCREEN_SESSION" -p 0 -X hardcopy "$WORK_DIR/logs/screen_output.txt" 2>/dev/null || true
+        
+        if [[ -f "$WORK_DIR/logs/screen_output.txt" ]]; then
+            local screen_content=$(cat "$WORK_DIR/logs/screen_output.txt")
+            
+            # 检测维度不匹配错误
+            if echo "$screen_content" | grep -q "expected sequence of length.*at dim"; then
+                error_type="dimension_mismatch"
+            # 检测P2P连接错误
+            elif echo "$screen_content" | grep -q "P2PDaemonError\|Daemon failed to start"; then
+                error_type="p2p_connection"
+            # 检测内存不足错误
+            elif echo "$screen_content" | grep -q "out of memory\|OOM\|MemoryError"; then
+                error_type="memory_exhausted"
+            # 检测其他常见错误
+            elif echo "$screen_content" | grep -q "Error\|Exception\|Traceback"; then
+                error_type="generic_error"
+            fi
+        fi
+    fi
+    
+    echo "$error_type"
+}
+
 # 检查训练是否正在运行
 check_training_running() {
-    if check_screen_session; then
-        # 检查screen会话中是否有python进程
-        local pids=$(pgrep -f "python.*swarm_launcher" 2>/dev/null || echo "")
-        if [[ -n "$pids" ]]; then
-            return 0  # 运行中
-        else
-            return 1  # 未运行
-        fi
-    else
-        return 1  # screen会话不存在
+    # 检查多种可能的训练进程
+    local pids=""
+    
+    # 检查rgym_exp.runner.swarm_launcher进程
+    pids=$(pgrep -f "rgym_exp.runner.swarm_launcher" 2>/dev/null || echo "")
+    if [[ -n "$pids" ]]; then
+        return 0  # 运行中
     fi
+    
+    # 检查genrl_swarm相关进程
+    pids=$(pgrep -f "genrl_swarm.*swarm_launcher" 2>/dev/null || echo "")
+    if [[ -n "$pids" ]]; then
+        return 0  # 运行中
+    fi
+    
+    # 检查通用的swarm_launcher进程
+    pids=$(pgrep -f "swarm_launcher" 2>/dev/null || echo "")
+    if [[ -n "$pids" ]]; then
+        return 0  # 运行中
+    fi
+    
+    return 1  # 未运行
+}
+
+# 增强的健康检查（检查进程是否真的在工作）
+check_training_health() {
+    if ! check_training_running; then
+        return 1  # 进程不存在
+    fi
+    
+    # 检查进程是否消耗CPU（表示在工作）
+    local pids=$(pgrep -f "rgym_exp.runner.swarm_launcher\|genrl_swarm.*swarm_launcher\|swarm_launcher" 2>/dev/null || echo "")
+    if [[ -n "$pids" ]]; then
+        for pid in $pids; do
+            local cpu_usage=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ' || echo "0")
+            if [[ -n "$cpu_usage" ]] && (( $(echo "$cpu_usage > 0.1" | bc -l 2>/dev/null || echo "0") )); then
+                return 0  # 找到活跃进程
+            fi
+        done
+    fi
+    
+    # 如果没有活跃进程，检查最近是否有输出
+    if check_screen_session; then
+        screen -S "$SCREEN_SESSION" -p 0 -X hardcopy "$WORK_DIR/logs/screen_output.txt" 2>/dev/null || true
+        
+        if [[ -f "$WORK_DIR/logs/screen_output.txt" ]]; then
+            local last_modified=$(stat -c %Y "$WORK_DIR/logs/screen_output.txt" 2>/dev/null || echo "0")
+            local current_time=$(date +%s)
+            local time_diff=$((current_time - last_modified))
+            
+            # 如果最近5分钟内有输出，认为是健康的
+            if [[ $time_diff -lt 300 ]]; then
+                return 0
+            fi
+        fi
+    fi
+    
+    return 1  # 进程可能僵死
 }
 
 # 检查内存使用情况
@@ -78,10 +167,19 @@ check_memory_usage() {
 cleanup_memory() {
     log_info "正在清理内存和进程..."
     
-    # 杀死可能的僵尸进程
-    pkill -f "python.*swarm_launcher" 2>/dev/null || true
+    # 杀死所有可能的训练进程
+    pkill -f "rgym_exp.runner.swarm_launcher" 2>/dev/null || true
+    pkill -f "genrl_swarm.*swarm_launcher" 2>/dev/null || true
+    pkill -f "swarm_launcher" 2>/dev/null || true
     pkill -f "yarn start" 2>/dev/null || true
     pkill -f "node.*modal-login" 2>/dev/null || true
+    
+    # 清理screen会话
+    if check_screen_session; then
+        log_info "清理screen会话: $SCREEN_SESSION"
+        screen -S "$SCREEN_SESSION" -X quit 2>/dev/null || true
+        sleep 2
+    fi
     
     # 清理缓存
     sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
@@ -92,19 +190,12 @@ cleanup_memory() {
     log_info "内存清理完成"
 }
 
-# 创建或重连screen会话
-create_or_attach_screen() {
-    if ! check_screen_session; then
-        log_info "创建新的screen会话: $SCREEN_SESSION"
-        screen -dmS "$SCREEN_SESSION"
+# 确保screen会话不存在（用于重启前清理）
+ensure_screen_session_clean() {
+    if check_screen_session; then
+        log_info "清理现有的screen会话: $SCREEN_SESSION"
+        screen -S "$SCREEN_SESSION" -X quit 2>/dev/null || true
         sleep 2
-    else
-        log_info "重新连接到screen会话: $SCREEN_SESSION"
-        # 如果会话存在但没有活动进程，清理会话
-        if ! check_training_running; then
-            screen -S "$SCREEN_SESSION" -p 0 -X stuff $'\003'  # 发送Ctrl+C
-            sleep 2
-        fi
     fi
 }
 
@@ -127,23 +218,21 @@ start_training() {
         rm -rf "$WORK_DIR/modal-login/temp-data"/*.json 2>/dev/null || true
     fi
     
-    # 检查虚拟环境
+    # 构建启动命令
+    local start_cmd=""
     if [[ -d "$VENV_PATH" ]]; then
-        log_info "激活虚拟环境: $VENV_PATH"
-        ACTIVATE_CMD="source $VENV_PATH/bin/activate"
+        log_info "使用虚拟环境: $VENV_PATH"
+        start_cmd="source $VENV_PATH/bin/activate && cd $WORK_DIR && ./$SCRIPT_NAME"
     else
         log_warn "虚拟环境不存在，使用系统Python"
-        ACTIVATE_CMD=""
+        start_cmd="cd $WORK_DIR && ./$SCRIPT_NAME"
     fi
     
-    # 在screen会话中启动训练
-    if [[ -n "$ACTIVATE_CMD" ]]; then
-        screen -S "$SCREEN_SESSION" -p 0 -X stuff "$ACTIVATE_CMD && cd $WORK_DIR && ./$SCRIPT_NAME"$'\n'
-    else
-        screen -S "$SCREEN_SESSION" -p 0 -X stuff "cd $WORK_DIR && ./$SCRIPT_NAME"$'\n'
-    fi
+    # 创建新的screen会话并直接执行命令
+    log_info "创建新的screen会话并启动训练"
+    screen -dmS "$SCREEN_SESSION" bash -c "$start_cmd"
     
-    log_info "训练启动命令已发送到screen会话"
+    log_info "训练启动命令已在screen会话中执行"
     
     # 等待启动
     sleep 30
@@ -155,11 +244,29 @@ start_training() {
             log_info "训练成功启动！"
             return 0
         fi
+        
+        # 检查screen会话是否还存在
+        if ! check_screen_session; then
+            log_error "Screen会话意外退出，可能启动失败"
+            return 1
+        fi
+        
         sleep 10
         ((check_count++))
     done
     
     log_error "训练启动失败，超时未检测到进程"
+    
+    # 输出screen会话的最后几行日志用于诊断
+    log_info "尝试获取screen会话输出进行诊断..."
+    screen -S "$SCREEN_SESSION" -p 0 -X hardcopy "$WORK_DIR/logs/screen_output.txt"
+    if [[ -f "$WORK_DIR/logs/screen_output.txt" ]]; then
+        log_info "Screen会话输出（最后10行）："
+        tail -n 10 "$WORK_DIR/logs/screen_output.txt" | while read line; do
+            log_info "  $line"
+        done
+    fi
+    
     return 1
 }
 
@@ -172,14 +279,14 @@ restart_training() {
     # 清理可能的残留进程
     cleanup_memory
     
-    # 创建或重连screen会话
-    create_or_attach_screen
-    
     # 多次尝试重启
     while [[ $restart_count -lt $MAX_RESTART_ATTEMPTS ]]; do
         ((restart_count++))
         
         log_info "重启尝试 $restart_count/$MAX_RESTART_ATTEMPTS"
+        
+        # 确保screen会话干净
+        ensure_screen_session_clean
         
         if start_training $restart_count; then
             log_info "训练重启成功！"
@@ -219,6 +326,29 @@ monitor_loop() {
         else
             log_warn "训练已停止！"
             
+            # 检测错误类型
+            local error_type=$(detect_error_type)
+            if [[ -n "$error_type" ]]; then
+                log_warn "检测到错误类型: $error_type"
+                
+                case "$error_type" in
+                    "dimension_mismatch")
+                        log_warn "维度不匹配错误 - 可能需要调整配置"
+                        ;;
+                    "p2p_connection")
+                        log_warn "P2P连接错误 - 将删除身份文件重新生成"
+                        ;;
+                    "memory_exhausted")
+                        log_warn "内存不足错误 - 将进行内存清理"
+                        ;;
+                    "generic_error")
+                        log_warn "通用错误 - 进行标准重启"
+                        ;;
+                esac
+            else
+                log_info "未检测到明确错误类型，进行标准重启"
+            fi
+            
             # 尝试重启
             if ! restart_training; then
                 log_error "重启失败，退出监控"
@@ -255,7 +385,13 @@ check_status() {
     echo "训练进程状态:"
     if check_training_running; then
         echo "  ✓ 训练正在运行"
-        echo "  进程ID: $(pgrep -f 'python.*swarm_launcher' 2>/dev/null || echo '无')"
+        local rgym_pids=$(pgrep -f 'rgym_exp.runner.swarm_launcher' 2>/dev/null || echo "")
+        local genrl_pids=$(pgrep -f 'genrl_swarm.*swarm_launcher' 2>/dev/null || echo "")
+        local swarm_pids=$(pgrep -f 'swarm_launcher' 2>/dev/null || echo "")
+        
+        [[ -n "$rgym_pids" ]] && echo "  进程ID (rgym): $rgym_pids"
+        [[ -n "$genrl_pids" ]] && echo "  进程ID (genrl): $genrl_pids"
+        [[ -n "$swarm_pids" ]] && echo "  进程ID (swarm): $swarm_pids"
     else
         echo "  ✗ 训练未运行"
     fi
@@ -297,7 +433,9 @@ kill_all_processes() {
     log_info "停止所有相关进程..."
     
     # 停止训练进程
-    pkill -f "python.*swarm_launcher" 2>/dev/null || true
+    pkill -f "rgym_exp.runner.swarm_launcher" 2>/dev/null || true
+    pkill -f "genrl_swarm.*swarm_launcher" 2>/dev/null || true
+    pkill -f "swarm_launcher" 2>/dev/null || true
     pkill -f "yarn start" 2>/dev/null || true
     pkill -f "node.*modal-login" 2>/dev/null || true
     
